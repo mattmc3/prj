@@ -80,7 +80,7 @@ main() {
     usage
     exit 0
   elif [ "${show_version:-0}" -eq 1 ]; then
-    say "prj ver 1.0.1"
+    say "prj ver 1.0.2"
     exit 0
   fi
 
