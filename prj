@@ -58,33 +58,18 @@ end
 EOF
 }
 
-# Keep project frecency in a dedicated zoxide DB so this wrapper does not mix
-# with global shell navigation history.
-prj_zoxide_data_dir() {
-  local data_dir
-
-  data_dir="${XDG_DATA_HOME:-$HOME/.local/share}/prj/zoxide"
-  mkdir -p "$data_dir" || return 1
-  say "$data_dir"
-}
-
 # Rank live-scanned candidates using existing zoxide scores.
-# Only projects that have been selected before in this wrapper will have
-# positive scores; everything else gets score 0 and is then sorted by path.
+# Projects picked via this wrapper earn positive scores; everything else
+# falls back to score 0, sorted alphabetically.
 rank_live_candidates_with_zoxide() {
-  local prj_dir zo_data_dir candidates_file scores_file ranked_file tab
+  local prj_dir zo_data_dir candidates_file scores_file tab
 
   prj_dir="$1"
   zo_data_dir="$2"
   tab="$(printf '\t')"
   candidates_file="$(mktemp "${TMPDIR:-/tmp}/prj-candidates.XXXXXX")" || return 1
   scores_file="$(mktemp "${TMPDIR:-/tmp}/prj-scores.XXXXXX")" || {
-    rm -f "$candidates_file"
-    return 1
-  }
-  ranked_file="$(mktemp "${TMPDIR:-/tmp}/prj-ranked.XXXXXX")" || {
-    rm -f "$candidates_file" "$scores_file"
-    return 1
+    rm -f "$candidates_file"; return 1
   }
 
   fd --type d --base-directory "$prj_dir" --hidden --no-ignore-vcs --max-depth 5 '\.git$' |
@@ -92,15 +77,10 @@ rank_live_candidates_with_zoxide() {
   sort -u > "$candidates_file"
 
   _ZO_DATA_DIR="$zo_data_dir" zoxide query -ls --base-dir "$prj_dir" 2>/dev/null |
-  awk -v pfx="$prj_dir/" -v OFS="$tab" '
-    {
-      score = $1
-      path = $0
-      sub(/^[[:space:]]*[0-9.]+[[:space:]]+/, "", path)
-      sub("^" pfx, "", path)
-      print path, score
-    }
-  ' > "$scores_file" || :
+  awk -v pfx="$prj_dir/" -v OFS="$tab" '{
+    path = $0; sub(/^[[:space:]]*[0-9.]+[[:space:]]+/, "", path); sub("^"pfx, "", path)
+    print path, $1
+  }' > "$scores_file"
 
   # When the scores file is empty (no prior selections) NR==FNR would be true
   # throughout the candidates file, so handle the cold-start case explicitly.
@@ -110,18 +90,14 @@ rank_live_candidates_with_zoxide() {
         score[$1] = $2
         next
       }
-      {
-        s = ($0 in score) ? score[$0] : 0
-        print s, $0
-      }
+      { print ($0 in score) ? score[$0] : 0, $0 }
     ' "$scores_file" "$candidates_file" |
-    sort -t "$tab" -k1,1nr -k2,2 > "$ranked_file"
-    cut -f2- "$ranked_file"
+    sort -t "$tab" -k1,1nr -k2,2 | cut -f2-
   else
     cat "$candidates_file"
   fi
 
-  rm -f "$candidates_file" "$scores_file" "$ranked_file"
+  rm -f "$candidates_file" "$scores_file"
 }
 
 # Main function
@@ -178,7 +154,8 @@ main() {
     die "prj: Project home directory not found '$PRJ_DIR'"
   fi
 
-  zo_data_dir="$(prj_zoxide_data_dir)" || die "prj: Could not create zoxide data dir"
+  zo_data_dir="${XDG_DATA_HOME:-$HOME/.local/share}/prj/zoxide"
+  mkdir -p "$zo_data_dir" || die "prj: Could not create zoxide data dir"
 
   # Live-scan candidates every run, rank with existing zoxide data, then keep
   # that order in fzf using --no-sort.
