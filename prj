@@ -19,8 +19,6 @@ elif ! is_cmd fd; then
   die "fd command not found"
 elif ! is_cmd zoxide; then
   die "zoxide command not found"
-elif ! is_cmd rg; then
-  die "rg command not found"
 fi
 
 # Print usage information
@@ -70,65 +68,60 @@ prj_zoxide_data_dir() {
   say "$data_dir"
 }
 
-# Live-scan git repos under PRJ_DIR and sync the dedicated zoxide DB.
-# - Add repos discovered by this scan that are not in DB yet.
-# - Remove stale DB entries that no longer exist in this scan.
-# This keeps candidate membership driven by live filesystem state while letting
-# zoxide maintain ranking from wrapper selections over time.
-sync_prj_zoxide_db() {
-  local prj_dir zo_data_dir candidates_file existing_file adds_file removes_file
-  local hash_file current_hash previous_hash
+# Rank live-scanned candidates using existing zoxide scores.
+# Only projects that have been selected before in this wrapper will have
+# positive scores; everything else gets score 0 and is then sorted by path.
+rank_live_candidates_with_zoxide() {
+  local prj_dir zo_data_dir candidates_file scores_file ranked_file tab
 
   prj_dir="$1"
   zo_data_dir="$2"
+  tab="$(printf '\t')"
   candidates_file="$(mktemp "${TMPDIR:-/tmp}/prj-candidates.XXXXXX")" || return 1
-  existing_file="$(mktemp "${TMPDIR:-/tmp}/prj-existing.XXXXXX")" || {
+  scores_file="$(mktemp "${TMPDIR:-/tmp}/prj-scores.XXXXXX")" || {
     rm -f "$candidates_file"
     return 1
   }
-  adds_file="$(mktemp "${TMPDIR:-/tmp}/prj-adds.XXXXXX")" || {
-    rm -f "$candidates_file" "$existing_file"
+  ranked_file="$(mktemp "${TMPDIR:-/tmp}/prj-ranked.XXXXXX")" || {
+    rm -f "$candidates_file" "$scores_file"
     return 1
   }
-  removes_file="$(mktemp "${TMPDIR:-/tmp}/prj-removes.XXXXXX")" || {
-    rm -f "$candidates_file" "$existing_file" "$adds_file"
-    return 1
-  }
-  hash_file="$zo_data_dir/.prj-scan.cksum"
 
   fd --type d --base-directory "$prj_dir" --hidden --no-ignore-vcs --max-depth 5 '\.git$' |
-  sed -e "s|/.git/$||" -e "s|^|$prj_dir/|" |
+  sed -e "s|/.git/$||" |
   sort -u > "$candidates_file"
 
-  current_hash="$(cksum < "$candidates_file" | awk '{print $1":"$2}')"
-  if [ -f "$hash_file" ]; then
-    previous_hash="$(cat "$hash_file" 2>/dev/null || true)"
+  _ZO_DATA_DIR="$zo_data_dir" zoxide query -ls --base-dir "$prj_dir" 2>/dev/null |
+  awk -v pfx="$prj_dir/" -v OFS="$tab" '
+    {
+      score = $1
+      path = $0
+      sub(/^[[:space:]]*[0-9.]+[[:space:]]+/, "", path)
+      sub("^" pfx, "", path)
+      print path, score
+    }
+  ' > "$scores_file" || :
+
+  # When the scores file is empty (no prior selections) NR==FNR would be true
+  # throughout the candidates file, so handle the cold-start case explicitly.
+  if [ -s "$scores_file" ]; then
+    awk -F "$tab" -v OFS="$tab" '
+      NR == FNR {
+        score[$1] = $2
+        next
+      }
+      {
+        s = ($0 in score) ? score[$0] : 0
+        print s, $0
+      }
+    ' "$scores_file" "$candidates_file" |
+    sort -t "$tab" -k1,1nr -k2,2 > "$ranked_file"
+    cut -f2- "$ranked_file"
   else
-    previous_hash=
-  fi
-  if [ "$current_hash" = "$previous_hash" ]; then
-    rm -f "$candidates_file" "$existing_file" "$adds_file" "$removes_file"
-    return 0
+    cat "$candidates_file"
   fi
 
-  _ZO_DATA_DIR="$zo_data_dir" zoxide query -la --base-dir "$prj_dir" > "$existing_file" 2>/dev/null || :
-
-  rg -Fvxf "$existing_file" "$candidates_file" > "$adds_file" || true
-  rg -Fvxf "$candidates_file" "$existing_file" > "$removes_file" || true
-
-  if [ -s "$adds_file" ]; then
-    _ZO_DATA_DIR="$zo_data_dir" tr '\n' '\0' < "$adds_file" |
-    xargs -0 -n 200 zoxide add >/dev/null 2>&1 || :
-  fi
-
-  if [ -s "$removes_file" ]; then
-    _ZO_DATA_DIR="$zo_data_dir" tr '\n' '\0' < "$removes_file" |
-    xargs -0 -n 200 zoxide remove >/dev/null 2>&1 || :
-  fi
-
-  printf '%s\n' "$current_hash" > "$hash_file"
-
-  rm -f "$candidates_file" "$existing_file" "$adds_file" "$removes_file"
+  rm -f "$candidates_file" "$scores_file" "$ranked_file"
 }
 
 # Main function
@@ -186,24 +179,19 @@ main() {
   fi
 
   zo_data_dir="$(prj_zoxide_data_dir)" || die "prj: Could not create zoxide data dir"
-  sync_prj_zoxide_db "$PRJ_DIR" "$zo_data_dir"
 
-  # zoxide query -ls returns score+path sorted by frecency from this dedicated
-  # DB. We strip the score, then keep that order in fzf with --no-sort.
+  # Live-scan candidates every run, rank with existing zoxide data, then keep
+  # that order in fzf using --no-sort.
   selection=$(
-    _ZO_DATA_DIR="$zo_data_dir" zoxide query -ls --base-dir "$PRJ_DIR" |
-    awk -v prefix="$PRJ_DIR/" '{
-      path = $0
-      sub(/^[[:space:]]*[0-9.]+[[:space:]]+/, "", path)
-      sub("^" prefix, "", path)
-      print path
-    }' |
+    rank_live_candidates_with_zoxide "$PRJ_DIR" "$zo_data_dir" |
     fzf --layout=reverse-list --no-sort --query="$query"
   )
 
   # Output the selected project directory
   if [ -n "$selection" ] && [ -d "$PRJ_DIR/$selection" ]; then
-    _ZO_DATA_DIR="$zo_data_dir" zoxide add "$PRJ_DIR/$selection" >/dev/null 2>&1 || :
+    (
+      _ZO_DATA_DIR="$zo_data_dir" zoxide add "$PRJ_DIR/$selection" >/dev/null 2>&1 || :
+    )
     say "$PRJ_DIR/$selection"
   fi
 }
