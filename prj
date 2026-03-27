@@ -112,10 +112,10 @@ main() {
 
   # Find and select project
   selection=$(
-    fd --type d --base-directory "$PRJ_DIR" --hidden --max-depth 5 '\.git$' |
+    fd --type d --base-directory "$PRJ_DIR" --hidden --no-ignore-vcs --max-depth 5 '\.git$' |
     sed -e "s|/.git/$||" |
     sort |
-    fzf --layout=reverse-list --query="$query"
+    fzf --layout=reverse-list --no-sort --query="$query"
   )
 
   # Output the selected project directory
