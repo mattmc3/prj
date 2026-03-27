@@ -56,9 +56,126 @@ end
 EOF
 }
 
+now_epoch() {
+  date +%s
+}
+
+# Frecency state lives in a TSV file at:
+#   <state_dir>/frecency.tsv
+# Each row is:
+#   relative_project_path<TAB>score<TAB>last_access_epoch<TAB>hit_count
+prj_state_file() {
+  local state_dir
+
+  state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/prj"
+  mkdir -p "$state_dir" || return 1
+  say "$state_dir/frecency.tsv"
+}
+
+# Rank discovered projects by a decayed score so recent picks matter more while
+# still preserving long-term frequent usage. Half-life defaults to 14 days.
+rank_candidates_by_frecency() {
+  local db_file now half_life_days half_life_sec tab
+
+  db_file="$1"
+  now="$2"
+  half_life_days="${PRJ_FRECENCY_HALFLIFE_DAYS:-14}"
+  case "$half_life_days" in
+    ''|*[!0-9]*) half_life_days=14 ;;
+  esac
+  if [ "$half_life_days" -le 0 ]; then
+    half_life_days=14
+  fi
+  half_life_sec=$((half_life_days * 86400))
+  tab="$(printf '\t')"
+
+  if [ -z "$db_file" ] || [ ! -f "$db_file" ]; then
+    awk -F "$tab" -v OFS="$tab" '{ print 0, $0 }' |
+    sort -t "$tab" -k1,1nr -k2,2 |
+    cut -f2-
+    return
+  fi
+
+  awk -F "$tab" -v OFS="$tab" -v now="$now" -v hls="$half_life_sec" '
+    NR == FNR {
+      hist_score[$1] = $2 + 0
+      hist_last[$1] = $3 + 0
+      next
+    }
+    {
+      p = $0
+      s = 0
+      if (p in hist_score) {
+        dt = now - hist_last[p]
+        if (dt < 0) dt = 0
+        # Exponential decay: score * 0.5^(age/half_life)
+        s = hist_score[p] * exp(log(0.5) * (dt / hls))
+      }
+      print s, p
+    }
+  ' "$db_file" - |
+  sort -t "$tab" -k1,1nr -k2,2 |
+  cut -f2-
+}
+
+# Apply decay to all tracked projects, then reward the chosen project with +1.
+# This keeps scores bounded over time while letting recent usage bubble up.
+update_frecency() {
+  local selected db_file now half_life_days half_life_sec tab tmp_file
+
+  selected="$1"
+  db_file="$2"
+  now="$3"
+
+  if [ -z "$selected" ] || [ -z "$db_file" ]; then
+    return 0
+  fi
+
+  half_life_days="${PRJ_FRECENCY_HALFLIFE_DAYS:-14}"
+  case "$half_life_days" in
+    ''|*[!0-9]*) half_life_days=14 ;;
+  esac
+  if [ "$half_life_days" -le 0 ]; then
+    half_life_days=14
+  fi
+  half_life_sec=$((half_life_days * 86400))
+  tab="$(printf '\t')"
+  tmp_file="${db_file}.tmp.$$"
+
+  if [ ! -f "$db_file" ]; then
+    : > "$db_file" || return 1
+  fi
+
+  awk -F "$tab" -v OFS="$tab" -v target="$selected" -v now="$now" -v hls="$half_life_sec" '
+    function decayed(score, last, dt) {
+      dt = now - last
+      if (dt < 0) dt = 0
+      return score * exp(log(0.5) * (dt / hls))
+    }
+    NF >= 4 {
+      p = $1
+      s = $2 + 0
+      l = $3 + 0
+      h = $4 + 0
+      s = decayed(s, l)
+      if (p == target) {
+        s = s + 1
+        l = now
+        h = h + 1
+        seen = 1
+      }
+      print p, s, l, h
+      next
+    }
+    END {
+      if (!seen) print target, 1, now, 1
+    }
+  ' "$db_file" > "$tmp_file" && mv "$tmp_file" "$db_file"
+}
+
 # Main function
 main() {
-  local show_help show_version init_shell query selection PRJ_DIR
+  local show_help show_version init_shell query selection PRJ_DIR now db_file
   PRJ_DIR="${PRJ_DIR:-$HOME/Projects}"
 
   # Parse options - just set variables
@@ -110,16 +227,21 @@ main() {
     die "prj: Project home directory not found '$PRJ_DIR'"
   fi
 
-  # Find and select project
+  now="$(now_epoch)"
+  db_file="$(prj_state_file)" || db_file=
+
+  # Build candidates, rank by frecency, then preserve that order in fzf.
+  # --no-sort is important: fzf should not re-rank our pre-scored list.
   selection=$(
     fd --type d --base-directory "$PRJ_DIR" --hidden --no-ignore-vcs --max-depth 5 '\.git$' |
     sed -e "s|/.git/$||" |
-    sort |
+    rank_candidates_by_frecency "$db_file" "$now" |
     fzf --layout=reverse-list --no-sort --query="$query"
   )
 
   # Output the selected project directory
   if [ -n "$selection" ] && [ -d "$PRJ_DIR/$selection" ]; then
+    update_frecency "$selection" "$db_file" "$now"
     say "$PRJ_DIR/$selection"
   fi
 }
