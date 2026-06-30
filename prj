@@ -3,6 +3,7 @@
 
 ##? prj - project jumper
 SCRIPT_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+PRJ_VERSION="2.0.1"
 
 # Common helpers
 die()    { warn "$@"; exit "${ERR:-1}"; }
@@ -40,6 +41,39 @@ prj() {
   unset MY_SELECTION
 }
 # eval "\$("$SCRIPT_PATH" -i sh)"
+EOF
+}
+
+# Emit a zsh TAB widget. When the line starts with "prj", TAB runs the prj
+# selector seeded with what you typed and jumps to the pick (no Enter). Any
+# other line delegates to whatever TAB was bound to (fzf-tab, normal
+# completion, ...). The bind is deferred to the first precmd so it runs after
+# the rest of zshrc (e.g. fzf-tab) loads and wins ^I regardless of source order.
+init_zsh_completion() {
+  cat <<EOF
+
+_prj_tab() {
+  if [[ \${\${(z)LBUFFER}[1]} == prj ]]; then
+    local q
+    q=\${LBUFFER#prj}; q=\${q## }
+    prj \${q:+"\$q"}    # opens the selector; the prj function cds on a pick
+    BUFFER=             # empty line + accept-line gives a fresh prompt so any
+    zle accept-line     # theme (p10k/gitstatus) repaints the new dir reliably
+  else
+    zle "\${_prj_default_tab:-expand-or-complete}"
+  fi
+}
+zle -N _prj_tab
+
+# Bind once, at first prompt, so we capture the final ^I owner and win it.
+_prj_bind_tab() {
+  typeset -g _prj_default_tab="\${\${(z)"\$(bindkey '^I')"}[2]:-expand-or-complete}"
+  [[ \$_prj_default_tab == _prj_tab ]] && _prj_default_tab=expand-or-complete
+  bindkey '^I' _prj_tab
+  add-zsh-hook -d precmd _prj_bind_tab
+}
+autoload -Uz add-zsh-hook
+add-zsh-hook precmd _prj_bind_tab
 EOF
 }
 
@@ -124,13 +158,18 @@ main() {
     usage
     exit 0
   elif [ "${show_version:-0}" -eq 1 ]; then
-    say "prj ver 2.0.0"
+    say "prj ver $PRJ_VERSION"
     exit 0
   fi
 
   if [ -n "$init_shell" ]; then
     case "$init_shell" in
-      sh|zsh|bash)
+      zsh)
+        init_sh
+        init_zsh_completion
+        exit 0
+        ;;
+      sh|bash)
         init_sh
         exit 0
         ;;
